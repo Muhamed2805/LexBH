@@ -47,6 +47,25 @@ docker compose run --rm dev pytest -m integration
 Plain `pytest` runs unit tests only. Integration tests use the `db` service, which starts
 automatically.
 
+## Inspecting a local law file
+
+The inspection tool shows how the parser reads a law text file. It only reads its input.
+
+Real law texts stay in `data/raw/`, which is gitignored. They must never be committed.
+
+```powershell
+docker compose run --rm --no-deps dev python -m lexbh.ingestion.cli data/raw/<file>.txt --law-id <slug> --title "<title>" --jurisdiction BIH
+```
+
+Add `--articles` for a document outline. Files are read as UTF-8 by default, so use
+`--encoding cp1250` for older Windows files.
+
+| Exit code | Meaning                                                                 |
+| --------- | ----------------------------------------------------------------------- |
+| `0`       | No error-severity diagnostics and no unassigned text                    |
+| `1`       | At least one error-severity diagnostic, or unassigned text              |
+| `2`       | Usage error, unreadable file, damaged text, bad metadata, or no article |
+
 ## Running the API
 
 Build the API image and start PostgreSQL, which is published on `127.0.0.1:5433`:
