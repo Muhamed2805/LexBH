@@ -10,6 +10,7 @@ the surrounding text over inventing a heading, because wrong structure leads to 
 import re
 from collections import Counter
 from dataclasses import dataclass, replace
+from itertools import pairwise
 
 from lexbh.ingestion.models import (
     Article,
@@ -37,6 +38,7 @@ _CYRILLIC_TO_LATIN = dict(zip(_CYRILLIC_LETTERS, _LATIN_EQUIVALENTS, strict=True
 _LATIN_ORDER = (
     "a b c č ć d dž đ e f g h i j k l lj m n nj o p q r s š t u v w x y z ž".split()  # noqa: SIM905
 )
+_BASIC_LATIN_ORDER = tuple("abcdefghijklmnopqrstuvwxyz")
 _LETTER = rf"(?:dž|lj|nj|[a-zčćđšž]|[{_CYRILLIC_LETTERS}])"
 _LETTER_RE = re.compile(_LETTER, re.IGNORECASE)
 _NOT_A_LETTER_NEXT = r"(?![^\W\d_])"
@@ -56,10 +58,14 @@ _INLINE_TAIL_RE = re.compile(r"^(?:\s*\.\s*(?:[-–—]\s+)?|\s*:\s*|\s+[-–—
 
 _PARAGRAPH_RE = re.compile(r"^\(([0-9]{1,3})\)\s*")
 _NUMBER_POINT_RE = re.compile(r"^([0-9]{1,3})\.?\)(?:\s+|$)")
-_DOTTED_NUMBER_RE = re.compile(r"^([0-9]{1,3})\.\s+(?=\S)")
+_DOTTED_NUMBER_RE = re.compile(r"^([0-9]{1,3})\.(\s*)(?=\S)")
+_NUMBER_WITH_DOT_AND_PARENTHESIS_RE = re.compile(r"^[0-9]{1,3}\.\)")
 _LETTER_POINT_RE = re.compile(
     rf"^(?:\((?P<wrapped>{_LETTER})\)|(?P<plain>{_LETTER})\))(?:\s+|$)", re.IGNORECASE
 )
+_DOTTED_LETTER_RE = re.compile(rf"^({_LETTER})\.(\s*)(?=\S)")
+_SPACED_INITIAL_RE = re.compile(r"^[^\W\d_]\.")
+_ATTACHED_ABBREVIATION_RE = re.compile(r"^[^\W\d_]{1,3}\.")
 _DASHES = "-–—−•·"
 _DASH_POINT_RE = re.compile(rf"^[{_DASHES}](?:\s+|$)")
 _TIGHT_DASH_RE = re.compile(rf"^[{_DASHES}](?=\S)")
@@ -167,8 +173,11 @@ _STRUCTURE_PATTERNS = (
     ),
 )
 _ROMAN_DIVISION_RE = re.compile(r"^(?P<label>[IVXІХ]+)(?:\.\s*|\s*[-–—]\s*|\s+)(?P<title>\S.*)$")
+_DASHED_ROMAN_DIVISION_RE = re.compile(r"^[IVXІХ]+\s*[-–—]\s*\S")
 _SMALL_ROMAN_RE = re.compile(r"X{0,3}(?:IX|IV|V?I{0,3})")
 _ROMAN_LOOKALIKES = str.maketrans({"І": "I", "Х": "X"})
+_ROMAN_NUMERAL_RE = re.compile(r"M{0,3}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})")
+_TITLE_WORD_RE = re.compile(r"[^\W\d_]+")
 _LAW_TITLE_PREFIXES = ("ZAKON", "ЗАКОН")
 
 _DATE = r"[0-9]{1,2}\.\s*(?:[0-9]{1,2}\.|[^\W\d_]+)\s*[0-9]{4}\.?"
@@ -195,6 +204,25 @@ _DATE_LINE_RE = re.compile(
 )
 
 _TERMINAL_PUNCTUATION = ".,:;!?"
+_SENTENCE_END = ".!?"
+_CITATION_WORDS = (
+    "član člana članu članom članova članovima članak članka članku "
+    "stav stava stavu stavom stavova stavak stavka stavku "
+    "tačka tačke tački tačku tačkom točka točke točki točku točkom "
+    "alineja alineje alineji alineju alinejom broj broja "
+    "члан члана члану чланом чланова члановима чланак чланка чланку "
+    "став става ставу ставом ставова ставак ставка ставку "
+    "тачка тачке тачки тачку тачком точка точке точки точку точком "
+    "алинеја алинеје алинеји алинеју алинејом број броја"
+)
+_CITATION_ABBREVIATIONS = "čl st tač al br чл ст тач ал бр"
+_CITATION_END_RE = re.compile(
+    rf"(?<![\w-])(?:{_either(_CITATION_WORDS.split())}"
+    rf"|(?:{_either(_CITATION_ABBREVIATIONS.split())})\.?)\s*$",
+    re.IGNORECASE,
+)
+_TITLE_BLOCK_STOPS = ".,;:"
+_BEFORE_TITLE_BLOCK = ".;:"
 _QUOTATION_MARKS = "\"'„“”«»‘’‚"
 _QUOTE_CLOSERS = {"„": '“”"', "«": "»"}
 _LINE_QUOTE_CLOSERS = {'"': '"', "“": "”", "»": "«"}
@@ -700,6 +728,7 @@ def _is_heading_like(content: str) -> bool:
         _parse_heading(content) is not None
         or _structure_parts(content) is not None
         or _division_parts(content) is not None
+        or _is_roman_range(content)
     )
 
 
@@ -711,6 +740,8 @@ def _is_title_line(line: _Line) -> bool:
         and content[-1] not in _TERMINAL_PUNCTUATION
         and content[0] not in _QUOTATION_MARKS
         and not _is_marker(content)
+        and _DOTTED_LETTER_RE.match(content) is None
+        and _DOTTED_NUMBER_RE.match(content) is None
         and not _is_heading_like(content)
     )
 
@@ -732,7 +763,10 @@ def _continues_centered_title(lines: list[_Line], index: int, state: _ScanState)
 def _title_above(
     lines: list[_Line], heading_index: int, state: _ScanState
 ) -> tuple[str, int] | None:
-    """Read a title of one or two lines above a heading, across any blank lines."""
+    """Read a title of one or two lines above a heading, across any blank lines.
+
+    Text directly under an article heading is always the body of that article.
+    """
     floor = state.consumed_through
     last = heading_index - 1
     while last > floor and lines[last].is_blank:
@@ -740,7 +774,11 @@ def _title_above(
     if last <= floor:
         return None
     first = last
-    while first - 1 > floor and not lines[first - 1].is_blank:
+    while (
+        first - 1 > floor
+        and not lines[first - 1].is_blank
+        and lines[first - 1].content[-1] not in _TITLE_BLOCK_STOPS
+    ):
         first -= 1
     if last - first + 1 > _MAX_TITLE_ABOVE_LINES:
         return None
@@ -748,7 +786,9 @@ def _title_above(
     boundary = first - 1
     follows_heading = boundary == floor and state.follows_structure
     if boundary >= 0 and not lines[boundary].is_blank and not follows_heading:
-        return None
+        ends_sentence = lines[boundary].content[-1] in _BEFORE_TITLE_BLOCK
+        if boundary == floor or not ends_sentence:
+            return None
 
     if _continues_centered_title(lines, first, state):
         return None
@@ -781,9 +821,20 @@ def _is_fully_uppercase(content: str) -> bool:
     return any(character.isalpha() for character in content) and content == content.upper()
 
 
-def _division_parts(content: str) -> tuple[str, str] | None:
+def _is_roman_range(content: str) -> bool:
+    """Report whether a line such as ``V - VIII`` holds only Roman numerals."""
     match = _ROMAN_DIVISION_RE.match(content)
     if match is None:
+        return False
+    words = _TITLE_WORD_RE.findall(match["title"])
+    return bool(words) and all(
+        _ROMAN_NUMERAL_RE.fullmatch(word.translate(_ROMAN_LOOKALIKES)) is not None for word in words
+    )
+
+
+def _division_parts(content: str) -> tuple[str, str] | None:
+    match = _ROMAN_DIVISION_RE.match(content)
+    if match is None or _is_roman_range(content):
         return None
     numeral = match["label"].translate(_ROMAN_LOOKALIKES)
     title = match["title"]
@@ -838,10 +889,39 @@ def _is_structure_title_below(line: _Line, title_case: bool) -> bool:
     )
 
 
+def _can_start_roman_division(lines: list[_Line], index: int) -> bool:
+    """Require a blank line above, or a finished sentence above a heading with a dash."""
+    if index == 0 or lines[index - 1].is_blank:
+        return True
+    return (
+        lines[index - 1].content[-1] in _SENTENCE_END
+        and _DASHED_ROMAN_DIVISION_RE.match(lines[index].content) is not None
+    )
+
+
+def _continues_division_title(lines: list[_Line], index: int) -> bool:
+    """Report whether a line is the uppercase second line of a division title."""
+    if index >= len(lines):
+        return False
+    line = lines[index]
+    content = line.content
+    return (
+        bool(content)
+        and not line.heading_blocked
+        and _is_fully_uppercase(content)
+        and len(content) <= _MAX_TITLE_LENGTH
+        and content[-1] not in _TERMINAL_PUNCTUATION
+        and content[0] not in _QUOTATION_MARKS
+        and not _is_marker(content)
+        and not _is_heading_like(content)
+        and not _is_closing_line(lines, index)
+    )
+
+
 def _match_roman_division(
     lines: list[_Line], index: int, state: _ScanState
 ) -> _StructureDraft | None:
-    if index > 0 and not lines[index - 1].is_blank:
+    if not _can_start_roman_division(lines, index):
         return None
     if _continues_centered_title(lines, index, state):
         return None
@@ -850,14 +930,20 @@ def _match_roman_division(
     if parts is None:
         return None
     label, title = parts
+    end = line.end
+    next_index = index + 1
+    if _continues_division_title(lines, next_index):
+        title = f"{title} {lines[next_index].content}"
+        end = lines[next_index].end
+        next_index += 1
     heading = StructureHeading(
         kind=StructureKind.DIVISION,
         label=label,
         title=title,
         start=line.content_start,
-        end=line.end,
+        end=end,
     )
-    return _StructureDraft(heading=heading, first_index=index, next_index=index + 1)
+    return _StructureDraft(heading=heading, first_index=index, next_index=next_index)
 
 
 def _match_unnumbered_division(
@@ -874,6 +960,7 @@ def _match_unnumbered_division(
         or content[-1] in _TERMINAL_PUNCTUATION
         or content[0] in _QUOTATION_MARKS
         or _is_marker(content)
+        or _is_roman_range(content)
         or (not state.has_article and _is_law_title(content, state.law_title))
         or _continues_centered_title(lines, index, state)
         or not _precedes_article(lines, index + 1)
@@ -1158,6 +1245,8 @@ def _continues_list(draft: _ParagraphDraft, line: _Line) -> bool:
     """Keep a list together when blank lines separate its points."""
     groups, last_marker = _scan_points(draft)
     previous = draft.lines[-1].content
+    if last_marker is not None and _wraps_citation(line.content, previous):
+        return True
     if _contextual_marker(line.content, previous, last_marker) is None:
         return False
     return bool(groups) or previous.endswith(":")
@@ -1181,12 +1270,13 @@ def _build_paragraph(
 
 def _marker_follows(lines: list[_Line], start: int, last_marker: _PointMarker | None) -> bool:
     """Report whether a point marker appears at or after a line of the same paragraph."""
-    for index in range(start, len(lines)):
-        line = lines[index]
-        if line.is_blank or line.quoted:
+    previous = lines[start - 1].content
+    for line in lines[start:]:
+        if line.is_blank:
             continue
-        if _contextual_marker(line.content, lines[index - 1].content, last_marker) is not None:
+        if not line.quoted and _contextual_marker(line.content, previous, last_marker) is not None:
             return True
+        previous = line.content
     return False
 
 
@@ -1223,6 +1313,9 @@ def _scan_points(draft: _ParagraphDraft) -> tuple[list[_PointGroup], _PointMarke
                 last_marker = None
             else:
                 current.append(line)
+        elif last_marker is not None and _wraps_citation(line.content, previous):
+            current = groups[-1][1]
+            current.append(line)
         previous = line.content
     return groups, last_marker
 
@@ -1283,7 +1376,7 @@ def _contextual_marker(
     """Recognize every marker, including forms that depend on the preceding line or point."""
     marker = _point_marker(content)
     if marker is not None:
-        return marker
+        return None if _is_wrapped_number(content, marker, previous, last_marker) else marker
     follows_colon = previous.endswith(":")
     tight_dash = _TIGHT_DASH_RE.match(content)
     if tight_dash is not None:
@@ -1293,18 +1386,96 @@ def _contextual_marker(
             if (follows_colon or follows_dash)
             else None
         )
-    dotted = _DOTTED_NUMBER_RE.match(content)
-    if dotted is None:
+    if _ends_with_citation_word(previous):
         return None
-    number = int(dotted[1])
-    starts_list = number == 1 and follows_colon
-    continues_list = (
+    return _dotted_letter_marker(content, follows_colon, last_marker) or _dotted_number_marker(
+        content, follows_colon, last_marker
+    )
+
+
+def _ends_with_citation_word(content: str) -> bool:
+    return _CITATION_END_RE.search(content) is not None
+
+
+def _wraps_citation(content: str, previous: str) -> bool:
+    """Report whether a dotted number or letter completes a citation from the line above."""
+    is_dotted = (
+        _DOTTED_NUMBER_RE.match(content) is not None
+        or _DOTTED_LETTER_RE.match(content) is not None
+        or _NUMBER_WITH_DOT_AND_PARENTHESIS_RE.match(content) is not None
+    )
+    return is_dotted and _ends_with_citation_word(previous)
+
+
+def _expects_number(last_marker: _PointMarker | None, number: int) -> bool:
+    return (
         last_marker is not None
         and last_marker.kind is PointKind.NUMBER
         and number == int(last_marker.label) + 1
     )
-    if starts_list or continues_list:
+
+
+def _is_wrapped_number(
+    content: str, marker: _PointMarker, previous: str, last_marker: _PointMarker | None
+) -> bool:
+    """Report whether a form like ``30.)`` inside a numbered list only continues a citation."""
+    return (
+        marker.kind is PointKind.NUMBER
+        and last_marker is not None
+        and last_marker.kind is PointKind.NUMBER
+        and _NUMBER_WITH_DOT_AND_PARENTHESIS_RE.match(content) is not None
+        and (
+            _ends_with_citation_word(previous)
+            or not _expects_number(last_marker, int(marker.label))
+        )
+    )
+
+
+def _dotted_number_marker(
+    content: str, follows_colon: bool, last_marker: _PointMarker | None
+) -> _PointMarker | None:
+    dotted = _DOTTED_NUMBER_RE.match(content)
+    if dotted is None:
+        return None
+    number = int(dotted[1])
+    has_space = bool(dotted[2])
+    if not has_space and not content[dotted.end()].isalpha():
+        return None
+    starts_list = number == 1 and follows_colon and has_space
+    if starts_list or _expects_number(last_marker, number):
         return _PointMarker(PointKind.NUMBER, str(number), dotted.end())
+    return None
+
+
+def _is_next_letter(raw: str, last_marker: _PointMarker | None) -> bool:
+    """Accept the next letter of the alphabet that the list is written in."""
+    if last_marker is None or last_marker.kind is not PointKind.LETTER:
+        return False
+    orders = (
+        (_LATIN_EQUIVALENTS,) if raw in _CYRILLIC_TO_LATIN else (_BASIC_LATIN_ORDER, _LATIN_ORDER)
+    )
+    step = (last_marker.label, _canonical_letter(raw))
+    return any(step in pairwise(order) for order in orders)
+
+
+def _dotted_letter_marker(
+    content: str, follows_colon: bool, last_marker: _PointMarker | None
+) -> _PointMarker | None:
+    """Read ``a.`` only at the start of a list or as the next expected letter."""
+    dotted = _DOTTED_LETTER_RE.match(content)
+    if dotted is None:
+        return None
+    rest = content[dotted.end() :]
+    if dotted[2]:
+        is_abbreviation = _SPACED_INITIAL_RE.match(rest) is not None
+    else:
+        is_abbreviation = not rest[0].isalpha() or _ATTACHED_ABBREVIATION_RE.match(rest) is not None
+    if is_abbreviation:
+        return None
+    raw = dotted[1]
+    starts_list = follows_colon and _canonical_letter(raw) == "a"
+    if starts_list or _is_next_letter(raw, last_marker):
+        return _PointMarker(PointKind.LETTER, _canonical_letter(raw), dotted.end())
     return None
 
 
