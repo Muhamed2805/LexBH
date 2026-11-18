@@ -8,6 +8,25 @@ RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir .
 
 
+# Development tools. The repository is bind mounted over /workspace at run time.
+FROM python:3.12-slim AS dev
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MYPY_CACHE_DIR=/tmp/mypy \
+    RUFF_CACHE_DIR=/tmp/ruff \
+    PYTEST_ADDOPTS="-o cache_dir=/tmp/pytest"
+
+WORKDIR /workspace
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/venv/bin/pip install --no-cache-dir -e ".[dev]"
+
+
+# Keep this stage last so a plain docker build produces the production image.
 FROM python:3.12-slim AS runtime
 
 ENV PATH="/opt/venv/bin:$PATH" \

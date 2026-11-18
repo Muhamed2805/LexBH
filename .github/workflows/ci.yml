@@ -53,3 +53,9 @@ jobs:
 
       - name: Integration tests
         run: pytest -m integration
+
+      - name: Apply migrations
+        run: alembic upgrade head
+
+      - name: Build runtime image
+        run: docker build --target runtime .
